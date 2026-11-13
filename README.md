@@ -13,9 +13,9 @@ edgecut movie.mkv 1:02:03.5 1:04:10 clip.mp4
 Requirements: Python 3.9+, and FFmpeg with libx264 (and libx265 for HEVC sources).
 
 ```sh
-uv tool install git+https://github.com/ZeroMarker/edgecut
+uv tool install edgecut
 # or
-pipx install git+https://github.com/ZeroMarker/edgecut
+pipx install edgecut
 ```
 
 Or copy `edgecut.py` into your project.
