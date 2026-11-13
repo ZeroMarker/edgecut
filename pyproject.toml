@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Frame-accurate H.264/HEVC clips that copy the video between keyframes and re-encode only the edges, using the FFmpeg CLI."
 readme = "README.md"
 license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.9"
 dependencies = []
 keywords = ["ffmpeg", "video", "cut", "trim", "h264", "hevc", "lossless"]
@@ -22,6 +23,8 @@ edgecut = "edgecut:main"
 
 [project.urls]
 Homepage = "https://github.com/ZeroMarker/edgecut"
+Repository = "https://github.com/ZeroMarker/edgecut"
+Issues = "https://github.com/ZeroMarker/edgecut/issues"
 
 [tool.setuptools]
 py-modules = ["edgecut"]

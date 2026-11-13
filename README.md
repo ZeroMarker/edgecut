@@ -92,3 +92,6 @@ The tests generate short videos with FFmpeg and compare every decoded frame of e
 ## License
 
 MIT
+
+Release maintainers: see [RELEASING.md](RELEASING.md) for packaging checks and the
+PyPI Trusted Publishing workflow.
