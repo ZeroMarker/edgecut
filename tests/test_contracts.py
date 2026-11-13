@@ -3,6 +3,7 @@ import argparse
 from contextlib import redirect_stderr, redirect_stdout
 from fractions import Fraction
 import io
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -17,7 +18,12 @@ class TimeTests(unittest.TestCase):
         for text, expected in [('0', 0), ('83.5', 83.5), ('1:23.5', 83.5), ('1:01:23', 3683),
                                ('123:59.5', 7439.5), ('100:00:00', 360000), ('00:00:00.001', 0.001)]:
             with self.subTest(text=text):
-                self.assertEqual(edgecut.parse_time(text), expected)
+                self.assertEqual(edgecut.parse_time(text), Fraction(str(expected)))
+
+    def test_decimal_times_remain_exact_through_cli_parsing(self):
+        self.assertEqual(edgecut.parse_time('0.4'), Fraction(2, 5))
+        self.assertEqual(edgecut.parse_time('0:00.4'), Fraction(2, 5))
+        self.assertEqual(edgecut.parse_time('5.4'), Fraction(27, 5))
 
     def test_invalid_times_raise_argument_error(self):
         for text in ['', '-1', '+1', '1:60', '1:61:00', 'abc', '1:2:3:4', 'nan', 'inf', '1e3',
@@ -139,6 +145,19 @@ class VerificationTests(unittest.TestCase):
 
 
 class CommandLineTests(unittest.TestCase):
+    def test_source_cannot_be_overwritten_via_same_path_or_alias(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / 'source.mp4'
+            source.write_bytes(b'original source')
+            symlink, hardlink = Path(folder) / 'symbolic.mp4', Path(folder) / 'hard.mp4'
+            symlink.symlink_to(source)
+            os.link(source, hardlink)
+            for output in [source, source.parent / '.' / source.name, symlink, hardlink]:
+                with self.subTest(output=output), patch('edgecut.cut') as cut, redirect_stderr(io.StringIO()):
+                    self.assertEqual(edgecut.main([str(source), '0', '3', str(output)]), 1)
+                    cut.assert_not_called()
+                    self.assertEqual(source.read_bytes(), b'original source')
+
     def test_failures_preserve_existing_output_and_clean_work_directory(self):
         with tempfile.TemporaryDirectory() as folder:
             output = Path(folder) / 'existing.mp4'

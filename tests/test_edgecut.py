@@ -64,6 +64,7 @@ class EdgecutTests(unittest.TestCase):
 
     def assert_exact_clip(self, output, source, start, end, copied, audio=True):
         """Same frames as the source range; the copied ones bit-identical."""
+        start, end = Fraction(str(start)), Fraction(str(end))
         expected, actual = frame_hashes(source, start, end), frame_hashes(output)
         self.assertEqual(len(actual), len(expected))
         source_pts = sorted(Fraction(p['pts_time']) for p in probe_packets(source, 'v:0')
@@ -185,6 +186,59 @@ class EdgecutTests(unittest.TestCase):
         source = self.directory / 'silent.mp4'
         make_video(source, audio_codec=None)
         self.assert_exact_clip(self.cut(source, 0.37, 5.62)[0], source, 0.37, 5.62, copied=100, audio=False)
+
+    def test_decimal_frame_boundaries_include_start_and_exclude_end(self):
+        source = self.directory / 'boundaries.mp4'
+        make_video(source)
+        for start, end in [(0.4, 5.4), (Fraction(2, 5), Fraction(27, 5))]:
+            with self.subTest(start=start, end=end):
+                p = edgecut.plan(source, start, end)
+                self.assertEqual(p['first_frame'], Fraction(2, 5))
+                self.assertEqual((p['head_frames'], p['body_frames'], p['tail_frames']), (15, 100, 10))
+                output = self.cut(source, start, end)[0]
+                self.assert_exact_clip(output, source, 0.4, 5.4, copied=100)
+
+    def test_nonzero_ts_timestamps_and_range_near_eof(self):
+        original, source = self.directory / 'source.mp4', self.directory / 'source.ts'
+        make_video(original)
+        subprocess.run(['ffmpeg', '-v', 'error', '-nostdin', '-i', str(original), '-c', 'copy', str(source)],
+                       check=True, capture_output=True, timeout=30)
+        first = min(Fraction(p['pts_time']) for p in probe_packets(source, 'v:0'))
+        # TS wraps AAC in ADTS headers; compare the original MP4 payloads,
+        # shifted onto the TS timeline, rather than hashing transport headers.
+        source_audio = probe_packets(original, 'a:0')
+        self.assertGreater(first, 1)
+        for low, high, copied in [(Fraction('0.37'), Fraction('5.62'), 100), (4, 8, 75)]:
+            with self.subTest(low=low, high=high):
+                start, end = first + low, first + high
+                output = self.cut(source, start, end)[0]
+                self.assert_exact_clip(output, source, start, end, copied=copied)
+                expected_audio = [p for p in source_audio if start <= Fraction(p['pts_time']) + first < end]
+                actual_audio = probe_packets(output, 'a:0')
+                self.assertEqual([p['data_hash'] for p in actual_audio], [p['data_hash'] for p in expected_audio])
+
+    def test_shifted_mp4_uses_video_end_timestamp_for_range_validation(self):
+        original, source = self.directory / 'source.mp4', self.directory / 'shifted.mp4'
+        make_video(original)
+        subprocess.run(['ffmpeg', '-v', 'error', '-nostdin', '-i', str(original), '-c', 'copy',
+                        '-output_ts_offset', '5', str(source)], check=True, capture_output=True, timeout=30)
+        self.assert_exact_clip(self.cut(source, Fraction('5.4'), Fraction('10.4'))[0],
+                               source, Fraction('5.4'), Fraction('10.4'), copied=100)
+        runner = Mock()
+        with self.assertRaisesRegex(edgecut.Unsupported, 'range is outside'):
+            edgecut.cut(source, 9, 14, self.directory, run=runner)
+        runner.assert_not_called()
+
+    def test_audio_boundaries_within_one_millisecond_of_packet_pts(self):
+        source = self.directory / 'audio-boundaries.mp4'
+        make_video(source)
+        original = probe_packets(source, 'a:0')
+        for start, end in [(Fraction('0.3841'), Fraction('5.6321')), (Fraction('0.384'), Fraction('5.632'))]:
+            with self.subTest(start=start, end=end):
+                output = self.cut(source, start, end)[0]
+                expected = [p for p in original if start <= Fraction(p['pts_time']) < end]
+                actual = probe_packets(output, 'a:0')
+                self.assertEqual([p['data_hash'] for p in actual], [p['data_hash'] for p in expected])
 
     def test_audio_packets_are_copied_without_reencoding(self):
         for codec, suffix in [('aac', 'mp4'), ('libmp3lame', 'mkv')]:

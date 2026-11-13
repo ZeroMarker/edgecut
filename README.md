@@ -30,6 +30,7 @@ edgecut [-v] SOURCE START END OUTPUT
 
 - `START` and `END` are seconds, `MM:SS` or `HH:MM:SS` (fractions allowed). The clip holds every frame shown in [START, END) on the source timeline.
 - `OUTPUT` is an MP4 file with the video tagged `avc1`/`hvc1`, `+faststart`, and timestamps starting at 0.
+- The CLI rejects an output that refers to the source file, including symbolic and hard links.
 - `-v` prints the plan and every FFmpeg command.
 - Exit status: `0` success, `2` source or range not supported (nothing was written; use a full re-encode), `1` a step or the output check failed.
 
@@ -49,6 +50,12 @@ with tempfile.TemporaryDirectory() as work:
 
 `cut()` takes optional `run(argv, engine) -> (returncode, output)` and `event(status, **details)` callbacks, so an application can run the FFmpeg commands under its own logging and timeouts.
 
+Times use the source's absolute presentation timestamps. For sources with a nonzero
+start time (common in MPEG-TS), include that offset in `START` and `END`; inspect it
+with `ffprobe -v error -show_entries format=start_time -of default=nw=1 SOURCE`.
+CLI decimal times are parsed exactly. Python callers can pass `Fraction` values;
+float inputs are interpreted using their decimal spelling.
+
 ## How it works
 
 ```
@@ -64,9 +71,14 @@ clip               [head)[      body       )[tail)
 4. **Mux.** Concatenate the TS parts, add the source audio (AAC/MP3 copied, others encoded to AAC), shift the first frame to 0, and write MP4.
 5. **Check.** The frame count must equal the plan, the duration must be within 0.5 s of the clip, and FFmpeg must decode 2 s around the start and each join without errors.
 
-Seeking only positions the demuxer at some earlier keyframe: Matroska seeks to a cue, and with `-copyts` FFmpeg's own `-ss` trimming is offset by the container start time. So every step selects frames and packets by source PTS: the `noise` bitstream filter's `drop` expression for copied packets, and `select`/`atrim` for decoded frames.
+Input seeks use absolute timestamps (`-seek_timestamp 1`). Matroska seeks to a cue,
+while MPEG-TS can land inside a GOP; the planner backs up until it includes a
+keyframe before the range. Every step then selects frames and packets by source
+PTS: integer time-base ticks in the `noise` bitstream filter and video `select`
+filter, and `atrim` for decoded audio. Packet boundaries follow [start, end)
+without a fixed time tolerance.
 
-Only the clip's own packets are read, so the time does not grow with the length of the source. It is dominated by encoding the edges, so it follows the source's keyframe interval.
+Only the clip and the preceding GOP needed for seeking are read, so the time does not grow with the length of the source. It is dominated by encoding the edges, so it follows the source's keyframe interval.
 
 ## Results
 

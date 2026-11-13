@@ -16,6 +16,7 @@ cost does not grow with the length of the source file. Uses the FFmpeg CLI only.
 import argparse
 from fractions import Fraction
 import json
+from math import ceil
 from pathlib import Path
 import re
 import shlex
@@ -56,6 +57,11 @@ def seconds(value):
     return f'{float(value):.6f}'
 
 
+def exact_time(value):
+    """Interpret float inputs as their decimal spelling; preserve rational inputs."""
+    return Fraction(str(value)) if isinstance(value, float) else Fraction(value)
+
+
 def ffprobe(args, timeout=120, error=Unsupported):
     try:
         result = subprocess.run(['ffprobe', '-v', 'error', *args, '-of', 'json'], stdin=subprocess.DEVNULL,
@@ -74,7 +80,8 @@ def first_nal_type(source, codec, at, timeout=120):
     """Type of the first picture NAL unit of the keyframe at `at` seconds."""
     bsf = 'h264_mp4toannexb' if codec == 'h264' else 'hevc_mp4toannexb'
     try:
-        data = subprocess.run(['ffmpeg', '-v', 'error', '-nostdin', '-ss', seconds(at + EPSILON), '-i', str(source),
+        data = subprocess.run(['ffmpeg', '-v', 'error', '-nostdin', '-seek_timestamp', '1',
+                               '-ss', seconds(at + EPSILON), '-i', str(source),
                                '-map', '0:v:0', '-c', 'copy', '-copypriorss', '1', '-bsf:v', bsf, '-frames:v', '1',
                                '-f', codec, '-'], stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout).stdout
     except subprocess.TimeoutExpired:
@@ -90,9 +97,9 @@ def first_nal_type(source, codec, at, timeout=120):
 
 def plan(source, start, end):
     """Probe the source and decide the three parts, or raise Unsupported."""
-    info = ffprobe(['-show_entries', 'stream=index,codec_type,codec_name,profile,pix_fmt,time_base,color_range,'
+    info = ffprobe(['-show_entries', 'stream=index,codec_type,codec_name,profile,pix_fmt,time_base,start_time,duration,color_range,'
                     'color_space,color_transfer,color_primaries:stream_disposition=attached_pic:'
-                    'stream_side_data=rotation:format=duration', str(source)])
+                    'stream_side_data=rotation:format=start_time,duration', str(source)])
     streams = info.get('streams', [])
     video = next((s for s in streams if s.get('codec_type') == 'video'
                   and not s.get('disposition', {}).get('attached_pic')), None)
@@ -104,19 +111,32 @@ def plan(source, start, end):
         raise Unsupported(f'unsupported video codec {codec}')
     if any(side.get('rotation') for side in video.get('side_data_list', [])):
         raise Unsupported('rotated video')
-    duration = float(info.get('format', {}).get('duration', 'nan'))
-    if not 0 <= start < end <= duration:
+    duration = info.get('format', {}).get('duration', 'nan')
+    try:
+        s, e = exact_time(start), exact_time(end)
+        origin = Fraction(info.get('format', {}).get('start_time', '0'))
+        limit = Fraction(video.get('start_time', str(origin))) + Fraction(video.get('duration', duration))
+    except (ValueError, ZeroDivisionError):
+        raise Unsupported(f'range is outside the source duration {duration}') from None
+    if not max(0, origin) <= s < e <= limit:
         raise Unsupported(f'range is outside the source duration {duration}')
     base = Fraction(video['time_base'])
     # Read past the end: with B-frames, frames shown before `end` can follow a
     # later-shown frame in decode order.
-    listed = ffprobe(['-select_streams', str(video['index']), '-read_intervals', f'{seconds(start)}%{seconds(end + 3)}',
-                      '-show_entries', 'packet=pts,flags', str(source)], timeout=600)['packets']
-    # Packets in decode order. Only PTS is used: Matroska stores no DTS.
-    if any(p.get('pts') is None for p in listed):
-        raise Unsupported('packets without timestamps')
-    packets = [(Fraction(p['pts']) * base, 'K' in p.get('flags', '')) for p in listed]
-    s, e = Fraction(start), Fraction(end)
+    seek, preroll = s, Fraction(1)
+    while True:
+        listed = ffprobe(['-select_streams', str(video['index']), '-read_intervals', f'{seconds(seek)}%{seconds(e + 3)}',
+                          '-show_entries', 'packet=pts,flags', str(source)], timeout=600)['packets']
+        # Packets in decode order. Only PTS is used: Matroska stores no DTS.
+        if any(p.get('pts') is None for p in listed):
+            raise Unsupported('packets without timestamps')
+        packets = [(Fraction(p['pts']) * base, 'K' in p.get('flags', '')) for p in listed]
+        # Unindexed demuxers such as MPEG-TS can seek into a GOP and omit
+        # reordered frames. Back up until the range includes an earlier keyframe.
+        if not packets or seek <= origin or any(key and pts <= s for pts, key in packets):
+            break
+        seek = max(origin, s - preroll)
+        preroll *= 2
     frames = sorted(pts for pts, _ in packets if s <= pts < e)
     if not frames:
         raise Unsupported('no frames in range')
@@ -144,6 +164,8 @@ def plan(source, start, end):
         'body_frames': len(body),
         'tail_frames': sum(1 for pts in frames if pts >= k2),
         'start': s, 'end': e,
+        'head_seek': seek,
+        'tail_seek': max(origin, max((pts for pts, key in packets if key and pts < k2), default=origin) - EPSILON),
     }
 
 
@@ -168,26 +190,31 @@ def ts_output(path, delay=0):
             '-muxpreload', '0', '-f', 'mpegts', str(path)]
 
 
-def between(low, high):
+def between(low, high, base):
     """noise bitstream filter expression dropping packets outside [low, high)."""
-    return f'noise=drop=lt(pts*tb\\,{float(low - EPSILON)!r})+gte(pts*tb\\,{float(high - EPSILON)!r})'
+    # Comparing integer ticks avoids float rounding at exact packet boundaries.
+    low_tick, high_tick = ceil(exact_time(low) / Fraction(base)), ceil(exact_time(high) / Fraction(base))
+    return f'noise=drop=lt(pts\\,{low_tick})+gte(pts\\,{high_tick})'
 
 
 # Seeking only positions the demuxer at some earlier keyframe (Matroska seeks to
-# a cue, and with -copyts FFmpeg's own -ss trimming is offset by the container
-# start time), so every step selects its frames or packets by source PTS.
+# a cue), so every step selects its frames or packets by source PTS. Input
+# seeks use absolute timestamps, including for files whose start time is nonzero.
 
 def body_command(source, p, work):
-    return ['ffmpeg', '-nostdin', '-y', '-copyts', '-ss', seconds(p['k1']), '-to', seconds(p['k2'] + 1),
+    return ['ffmpeg', '-nostdin', '-y', '-copyts', '-seek_timestamp', '1',
+            '-ss', seconds(p['k1']), '-to', seconds(p['k2'] + 1),
             '-i', str(source), '-map', f"0:{p['video']['index']}", '-c', 'copy', '-copypriorss', '1',
-            '-bsf:v', between(p['k1'], p['k2']), *ts_output(work / 'body.ts', None)]
+            '-bsf:v', between(p['k1'], p['k2'], p['video']['time_base']), *ts_output(work / 'body.ts', None)]
 
 
 def edge_command(source, p, work, name, first, frames, delay):
     """Re-encode `frames` frames starting at the frame shown at `first`."""
-    return ['ffmpeg', '-nostdin', '-y', '-copyts', '-noaccurate_seek', '-ss', seconds(first - EPSILON),
+    first_tick = ceil(first / Fraction(p['video']['time_base']))
+    return ['ffmpeg', '-nostdin', '-y', '-copyts', '-noaccurate_seek', '-seek_timestamp', '1',
+            '-ss', seconds(p[f'{name}_seek']),
             '-i', str(source), '-map', f"0:{p['video']['index']}",
-            '-vf', f'select=gte(t\\,{float(first - EPSILON)!r})', '-frames:v', str(frames), *encoder_args(p),
+            '-vf', f'select=gte(pts\\,{first_tick})', '-frames:v', str(frames), *encoder_args(p),
             *ts_output(work / f'{name}.ts', delay)]
 
 
@@ -218,10 +245,12 @@ def mux_command(source, p, work, parts):
                '-i', 'concat:' + '|'.join(str(work / f'{part}.ts') for part in parts)]
     maps = ['-map', '0:v']
     if p['audio']:
-        command += ['-noaccurate_seek', '-ss', seconds(p['start']), '-to', seconds(p['end'] + 1), '-i', str(source)]
+        command += ['-noaccurate_seek', '-seek_timestamp', '1', '-ss', seconds(p['head_seek']),
+                    '-to', seconds(p['end'] + 1), '-i', str(source)]
         maps += ['-map', f"1:{p['audio']['index']}"]
         if p['audio']['codec_name'] in COPY_AUDIO:
-            maps += ['-c:a', 'copy', '-copypriorss:a', '1', '-bsf:a', between(p['start'], p['end'])]
+            maps += ['-c:a', 'copy', '-copypriorss:a', '1', '-bsf:a',
+                     between(p['start'], p['end'], p['audio']['time_base'])]
         else:
             maps += ['-af', f"atrim=start={float(p['start'])!r}:end={float(p['end'])!r}", '-c:a', 'aac', '-b:a', '192k']
     return [*command, *maps, '-c:v', 'copy', '-tag:v', CODECS[p['codec']][2], '-output_ts_offset',
@@ -292,12 +321,12 @@ def parse_time(value):
     if not re.fullmatch(r'(\d+:){0,2}\d+(\.\d+)?', value):
         raise argparse.ArgumentTypeError(f'invalid time {value!r}; use seconds, MM:SS or HH:MM:SS')
     *rest, last = value.split(':')
-    if any(int(part) >= 60 for part in rest[1:]) or (rest and float(last) >= 60):
+    if any(int(part) >= 60 for part in rest[1:]) or (rest and Fraction(last) >= 60):
         raise argparse.ArgumentTypeError(f'invalid time {value!r}')
-    total = 0.0
+    total = 0
     for part in rest:
         total = total * 60 + int(part)
-    return total * 60 + float(last) if rest else float(last)
+    return total * 60 + Fraction(last)
 
 
 def main(argv=None):
@@ -321,6 +350,9 @@ def main(argv=None):
             print(status, json.dumps(details), file=sys.stderr)
 
     try:
+        if (args.source.resolve() == args.output.resolve()
+                or (args.source.exists() and args.output.exists() and args.source.samefile(args.output))):
+            raise CutFailed('source and output must be different files')
         with tempfile.TemporaryDirectory(prefix='edgecut-') as work:
             shutil.copyfile(cut(args.source, args.start, args.end, work, run, event), args.output)
     except Unsupported as exc:
