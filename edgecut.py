@@ -25,7 +25,7 @@ import subprocess
 import sys
 import tempfile
 
-__version__ = '0.1.0'
+__version__ = '0.1.1'
 ENGINE = 'edgecut'
 
 # codec: (encoder, extra encoder args, MP4 tag). The parts carry in-band
