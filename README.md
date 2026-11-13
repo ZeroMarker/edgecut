@@ -4,6 +4,8 @@ Frame-accurate clips from H.264 and HEVC videos in seconds. edgecut copies the o
 
 It is a single Python file with no dependencies beyond the standard library. All video work is done by the `ffmpeg` and `ffprobe` command-line tools.
 
+Inspired by [skeskinen/smartcut](https://github.com/skeskinen/smartcut) and its approach of cutting video with minimal re-encoding around the cut points.
+
 ```sh
 edgecut movie.mkv 1:02:03.5 1:04:10 clip.mp4
 ```
