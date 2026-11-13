@@ -91,6 +91,22 @@ python3 -m unittest discover -s tests -v
 
 The tests generate short videos with FFmpeg and compare every decoded frame of each clip with the source range: H.264 with B-frames, HEVC, 10-bit, Matroska, clips starting at 0, and start/end exactly on keyframes. They also check rejection of unsupported sources and errors from failed steps.
 
+They verify every copied body frame at its original position, presentation timestamps,
+increasing DTS across joins, edge-frame quality (PSNR), AAC/MP3 packet hashes and audio
+timing, PCM-to-AAC audio, video without audio, fractional frame rates, colour metadata
+and MP4 faststart. Failure tests
+cover invalid ranges, corrupt output, each failed encoding/muxing stage, CLI exit codes,
+preserving existing output on failure and temporary-file cleanup.
+
+Input validation, probing and CLI failure tests also run without FFmpeg:
+
+```sh
+python3 -m unittest discover -s tests -p test_contracts.py -v
+```
+
+CI runs the suite on Python 3.9 and 3.14 with Ubuntu 24.04. It measures statement
+and branch coverage with `coverage.py` and requires at least 95% combined coverage.
+
 ## License
 
 MIT
