@@ -138,10 +138,93 @@ class VerificationTests(unittest.TestCase):
                     with self.assertRaisesRegex(edgecut.CutFailed, 'decode errors near a join'):
                         edgecut.verify(self.plan, Path('clip.mp4'), runner)
 
+    def test_benign_muxer_warning_does_not_fail(self):
+        info = {'streams': [{'codec_type': 'video', 'nb_read_packets': '50'}], 'format': {'duration': '2'},
+                'packets': [{'dts_time': '0.0'}, {'dts_time': '0.04'}]}
+        runner = Mock(return_value=(0, 'Application provided invalid, non monotonically increasing dts to muxer in stream 0: 12 >= 12'))
+        with patch('edgecut.ffprobe', return_value=info):
+            edgecut.verify(self.plan, Path('clip.mp4'), runner)
+
+    def test_strict_mode_rejects_benign_muxer_warning(self):
+        info = {'streams': [{'codec_type': 'video', 'nb_read_packets': '50'}], 'format': {'duration': '2'},
+                'packets': [{'dts_time': '0.0'}, {'dts_time': '0.04'}]}
+        runner = Mock(return_value=(0, 'Application provided invalid, non monotonically increasing dts to muxer in stream 0: 12 >= 12'))
+        with patch('edgecut.ffprobe', return_value=info):
+            with self.assertRaisesRegex(edgecut.CutFailed, 'decode errors near a join'):
+                edgecut.verify(self.plan, Path('clip.mp4'), runner, strict=True)
+
+    def test_strict_mode_rejects_equal_dts(self):
+        info = {'streams': [{'codec_type': 'video', 'nb_read_packets': '50'}], 'format': {'duration': '2'},
+                'packets': [{'dts_time': '0.04'}, {'dts_time': '0.04'}]}
+        runner = Mock()
+        with patch('edgecut.ffprobe', return_value=info):
+            with self.assertRaisesRegex(edgecut.CutFailed, 'not strictly increasing'):
+                edgecut.verify(self.plan, Path('clip.mp4'), runner, strict=True)
+        runner.assert_not_called()
+
+    def test_backwards_packet_timestamps_fail_before_decode(self):
+        info = {'streams': [{'codec_type': 'video', 'nb_read_packets': '50'}], 'format': {'duration': '2'},
+                'packets': [{'dts_time': '0.08'}, {'dts_time': '0.04'}]}
+        runner = Mock()
+        with patch('edgecut.ffprobe', return_value=info):
+            with self.assertRaisesRegex(edgecut.CutFailed, 'timestamps go backwards'):
+                edgecut.verify(self.plan, Path('clip.mp4'), runner)
+        runner.assert_not_called()
+
     def test_empty_copied_body_is_failure(self):
         with patch('edgecut.ffprobe', return_value={'packets': []}):
             with self.assertRaisesRegex(edgecut.CutFailed, 'copied body is empty'):
                 edgecut.body_timing(Path('/unused'))
+
+
+class MuxTests(unittest.TestCase):
+    def test_chapters_are_dropped_explicitly(self):
+        plan = {'codec': 'h264', 'audio': None, 'head_seek': Fraction(0), 'end': Fraction(2),
+                'start': Fraction(0), 'first_frame': Fraction(0), 'video': {'index': 0}}
+        command = edgecut.mux_command('source.mp4', plan, Path('/work'), ['body'])
+        self.assertIn('-map_chapters', command)
+        self.assertEqual(command[command.index('-map_chapters') + 1], '-1')
+
+
+class FallbackTests(unittest.TestCase):
+    def test_hevc_hvc1_decode_failure_retries_with_hev1(self):
+        plan = {'codec': 'hevc', 'head_frames': 1, 'body_frames': 1, 'tail_frames': 1,
+                'first_frame': Fraction(0), 'k1': Fraction(0), 'k2': Fraction(1)}
+        run = Mock(return_value=(0, ''))
+        run.parallel_safe = False
+        mux = Mock(side_effect=lambda source, p, work, parts, tag=None: ['mux', tag or 'hvc1'])
+        verify = Mock(side_effect=[edgecut.CutFailed('decode errors near a join: bad RPS'), None])
+        with patch.multiple(edgecut,
+                            plan=Mock(return_value=plan),
+                            body_command=Mock(return_value=['body']),
+                            body_timing=Mock(return_value=(0, 0)),
+                            edge_delays=Mock(return_value=(0, 0)),
+                            edge_command=Mock(return_value=['edge']),
+                            mux_command=mux,
+                            verify=verify):
+            edgecut.cut('source.mp4', 0, 1, Path('/work'), run=run)
+        self.assertEqual(mux.call_count, 2)
+        self.assertIsNone(mux.call_args_list[0].kwargs.get('tag'))
+        self.assertEqual(mux.call_args_list[1].kwargs['tag'], 'hev1')
+        self.assertEqual(verify.call_count, 2)
+
+    def test_h264_decode_failure_is_not_retried(self):
+        plan = {'codec': 'h264', 'head_frames': 1, 'body_frames': 1, 'tail_frames': 1,
+                'first_frame': Fraction(0), 'k1': Fraction(0), 'k2': Fraction(1)}
+        run = Mock(return_value=(0, ''))
+        run.parallel_safe = False
+        mux = Mock(return_value=['mux'])
+        with patch.multiple(edgecut,
+                            plan=Mock(return_value=plan),
+                            body_command=Mock(return_value=['body']),
+                            body_timing=Mock(return_value=(0, 0)),
+                            edge_delays=Mock(return_value=(0, 0)),
+                            edge_command=Mock(return_value=['edge']),
+                            mux_command=mux,
+                            verify=Mock(side_effect=edgecut.CutFailed('decode errors near a join'))):
+            with self.assertRaisesRegex(edgecut.CutFailed, 'decode errors'):
+                edgecut.cut('source.mp4', 0, 1, Path('/work'), run=run)
+        self.assertEqual(mux.call_count, 1)
 
 
 class CommandLineTests(unittest.TestCase):
@@ -165,7 +248,7 @@ class CommandLineTests(unittest.TestCase):
             for error, status in [(edgecut.Unsupported('short clip'), 2),
                                   (edgecut.CutFailed('encode failed'), 1), (OSError('missing ffmpeg'), 1)]:
                 workdirs = []
-                def fail(source, start, end, work, *callbacks):
+                def fail(source, start, end, work, *callbacks, **kwargs):
                     workdirs.append(Path(work))
                     (Path(work) / 'partial.ts').write_bytes(b'partial')
                     raise error
@@ -174,6 +257,14 @@ class CommandLineTests(unittest.TestCase):
                 self.assertEqual(output.read_bytes(), b'existing file')
                 self.assertTrue(workdirs)
                 self.assertTrue(all(not path.exists() for path in workdirs))
+
+    def test_strict_flag_is_forwarded_to_cut(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source, output = Path(folder) / 'source.mp4', Path(folder) / 'clip.mp4'
+            source.write_bytes(b'source')
+            with patch('edgecut.cut', return_value=source) as cut, redirect_stderr(io.StringIO()):
+                self.assertEqual(edgecut.main(['--strict', str(source), '0', '3', str(output)]), 0)
+            self.assertTrue(cut.call_args.kwargs['strict'])
 
     def test_invalid_arguments_do_not_start_cut(self):
         with patch('edgecut.cut') as cut:

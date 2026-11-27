@@ -25,13 +25,14 @@ Or copy `edgecut.py` into your project.
 ## Usage
 
 ```
-edgecut [-v] SOURCE START END OUTPUT
+edgecut [-v] [--strict] SOURCE START END OUTPUT
 ```
 
 - `START` and `END` are seconds, `MM:SS` or `HH:MM:SS` (fractions allowed). The clip holds every frame shown in [START, END) on the source timeline.
-- `OUTPUT` is an MP4 file with the video tagged `avc1`/`hvc1`, `+faststart`, and timestamps starting at 0.
+- `OUTPUT` is an MP4 file with the video tagged `avc1` (or `hvc1`/`hev1` for HEVC), `+faststart`, and timestamps starting at 0.
 - The CLI rejects an output that refers to the source file, including symbolic and hard links.
 - `-v` prints the plan and every FFmpeg command.
+- `--strict` fails on any decoder stderr and requires strictly increasing DTS; the default tolerates known-benign muxer/demuxer warnings and equal DTS values.
 - Exit status: `0` success, `2` source or range not supported (nothing was written; use a full re-encode), `1` a step or the output check failed.
 
 From Python:
@@ -50,6 +51,14 @@ with tempfile.TemporaryDirectory() as work:
 
 `cut()` takes optional `run(argv, engine) -> (returncode, output)` and `event(status, **details)` callbacks, so an application can run the FFmpeg commands under its own logging and timeouts.
 
+To cut several ranges, use `cut_many()`. Clips are returned in input order and are written to `work/cut-000/clip.mp4`, `work/cut-001/clip.mp4`, ...:
+
+```python
+paths = edgecut.cut_many('movie.mp4', [(10, 20), (30, 45)], work, jobs=4)
+```
+
+Ranges are cut concurrently when the runner is safe for concurrent use; the two edges of each individual clip stay sequential to avoid oversubscribing the CPU. Pass `strict=True` to `cut()` or `cut_many()` for the same verification policy as the `--strict` flag.
+
 Times use the source's absolute presentation timestamps. For sources with a nonzero
 start time (common in MPEG-TS), include that offset in `START` and `END`; inspect it
 with `ffprobe -v error -show_entries format=start_time -of default=nw=1 SOURCE`.
@@ -67,8 +76,8 @@ clip               [head)[      body       )[tail)
 
 1. **Plan** with ffprobe, without decoding. List the video packets from the keyframe before `start` to 3 s past `end` (with B-frames, frames shown just before `end` can come later in decode order). K1 is the first IDR keyframe at or after `start`, K2 the last at or before `end`; the NAL unit type of each candidate is checked (H.264 5, HEVC 19/20). The clip is rejected if it has fewer than two IDR keyframes or any packet between them is shown outside [K1, K2) (open GOP).
 2. **Body.** Stream-copy [K1, K2) to MPEG-TS with the source timestamps and in-band parameter sets.
-3. **Head and tail.** Re-encode [start, K1) and [K2, end) with libx264 (`veryfast`, CRF 16) or libx265 (`superfast`, CRF 18), without B-frames, matching the source pixel format, H.264 profile, colour properties and time base. Their DTS is shifted by the body's reorder delay, read from the written body because Matroska stores no DTS, so DTS keeps increasing across both joins.
-4. **Mux.** Concatenate the TS parts, add the source audio (AAC/MP3 copied, others encoded to AAC), shift the first frame to 0, and write MP4.
+3. **Head and tail.** Re-encode [start, K1) and [K2, end) with libx264 (`veryfast`, CRF 16) or libx265 (`superfast`, CRF 18), without B-frames, matching the source pixel format, H.264 profile, colour properties and time base. The two edges are independent, so they are encoded concurrently. Their DTS is shifted by the body's reorder delay, read from the written body because Matroska stores no DTS, so DTS keeps increasing across both joins.
+4. **Mux.** Concatenate the TS parts, add the source audio (AAC/MP3 copied, others encoded to AAC), shift the first frame to 0, and write MP4 without chapters or metadata. HEVC is first tagged `hvc1`; if the parts decode with mismatched parameter sets, it is remuxed as `hev1`.
 5. **Check.** The frame count must equal the plan, the duration must be within 0.5 s of the clip, and FFmpeg must decode 2 s around the start and each join without errors.
 
 Input seeks use absolute timestamps (`-seek_timestamp 1`). Matroska seeks to a cue,
@@ -93,7 +102,7 @@ On real 1080p–1440p sources (MP4 and MKV, clips of 28–140 s), compared with 
 
 - Video codecs: H.264 and HEVC with IDR keyframes. Open-GOP sources, other codecs, rotated video, and clips shorter than about two keyframe intervals raise `Unsupported`.
 - Only the first video stream and the first audio stream are kept; subtitles, chapters and metadata are dropped.
-- Not yet verified: HEVC output in browsers, and Safari/iOS playback across the joins, where parameter sets change in-band under the `avc1`/`hvc1` tags.
+- HEVC output starts with the `hvc1` tag. If the concatenated parts cannot decode because their parameter sets differ, it is remuxed once as `hev1`; Safari/iOS may reject `hev1`.
 
 ## Tests
 

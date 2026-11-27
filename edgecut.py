@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 
 __version__ = '0.1.1'
 ENGINE = 'edgecut'
@@ -39,6 +40,10 @@ IDR_TYPES = {'h264': {5}, 'hevc': {19, 20}}
 H264_PROFILES = {'Baseline': 'baseline', 'Constrained Baseline': 'baseline', 'Main': 'main', 'High': 'high',
                  'High 10': 'high10', 'High 4:2:2': 'high422', 'High 4:4:4 Predictive': 'high444'}
 COPY_AUDIO = {'aac', 'mp3'}
+# Warnings that some demuxers/decoders print even for a valid stream. Container
+# packet order is checked separately in verify().
+BENIGN_DECODE_WARNING = re.compile(
+    r'Referenced QT chapter track not found|Application provided invalid, non monotonically increasing dts to muxer')
 # Added to every intermediate timestamp so parts starting near zero never go
 # negative in MPEG-TS (which cannot store negative timestamps).
 TS_OFFSET = 10
@@ -148,6 +153,14 @@ def plan(source, start, end):
             idr[i] = first_nal_type(source, codec, packets[i][0]) in IDR_TYPES[codec]
         return idr[i]
 
+    # Most clips use IDR keyframes at both ends. Probe the first and last
+    # candidates concurrently so the common case needs one seek round instead
+    # of two sequential ones.
+    if len(keys) >= 2:
+        picks = sorted({keys[0], keys[-1]})
+        with ThreadPoolExecutor(max_workers=len(picks)) as pool:
+            idr.update(pool.map(lambda i: (i, first_nal_type(source, codec, packets[i][0]) in IDR_TYPES[codec]), picks))
+
     first = next((i for i in keys if is_idr(i)), None)
     last = next((i for i in reversed(keys) if first is not None and i > first and is_idr(i)), None)
     if first is None or last is None or packets[first][0] >= e:
@@ -240,7 +253,7 @@ def edge_delays(p, timing):
     return delay, tail
 
 
-def mux_command(source, p, work, parts):
+def mux_command(source, p, work, parts, tag=None):
     command = ['ffmpeg', '-nostdin', '-y', '-copyts', '-itsoffset', str(-TS_OFFSET),
                '-i', 'concat:' + '|'.join(str(work / f'{part}.ts') for part in parts)]
     maps = ['-map', '0:v']
@@ -253,13 +266,20 @@ def mux_command(source, p, work, parts):
                      between(p['start'], p['end'], p['audio']['time_base'])]
         else:
             maps += ['-af', f"atrim=start={float(p['start'])!r}:end={float(p['end'])!r}", '-c:a', 'aac', '-b:a', '192k']
-    return [*command, *maps, '-c:v', 'copy', '-tag:v', CODECS[p['codec']][2], '-output_ts_offset',
-            seconds(-p['first_frame']), '-map_metadata', '-1', '-movflags', '+faststart', str(work / 'clip.mp4')]
+    return [*command, *maps, '-c:v', 'copy', '-tag:v', tag or CODECS[p['codec']][2], '-output_ts_offset',
+            seconds(-p['first_frame']), '-map_metadata', '-1', '-map_chapters', '-1',
+            '-movflags', '+faststart', str(work / 'clip.mp4')]
 
 
-def verify(p, output, run):
-    """Check frame count and duration, and decode around each join."""
-    info = ffprobe(['-count_packets', '-show_entries', 'stream=codec_type,nb_read_packets:format=duration',
+def verify(p, output, run, strict=False):
+    """Check frame count, duration, packet order, and decode around each join.
+
+    In strict mode any decoder stderr fails and DTS must strictly increase;
+    otherwise known-benign muxer/demuxer warnings are ignored and equal DTS
+    values are tolerated.
+    """
+    info = ffprobe(['-select_streams', 'v:0', '-count_packets',
+                    '-show_entries', 'stream=codec_type,nb_read_packets:format=duration:packet=dts_time',
                     str(output)], error=CutFailed)
     count = next((int(s['nb_read_packets']) for s in info.get('streams', []) if s.get('codec_type') == 'video'), 0)
     expected = p['head_frames'] + p['body_frames'] + p['tail_frames']
@@ -268,6 +288,15 @@ def verify(p, output, run):
     duration = float(info.get('format', {}).get('duration', 'nan'))
     if not abs(duration - float(p['end'] - p['start'])) <= 0.5:
         raise CutFailed(f"output lasts {duration} seconds instead of {float(p['end'] - p['start'])}")
+    # The join must not reorder or rewind container timestamps. Checking the
+    # packets is stronger than trusting the decoder's stderr, which also emits
+    # harmless muxer warnings for some sources.
+    times = [Fraction(packet['dts_time']) for packet in info.get('packets', [])
+             if packet.get('dts_time') not in (None, 'N/A')]
+    out_of_order = ((later <= earlier) if strict else (later < earlier) for earlier, later in zip(times, times[1:]))
+    if any(out_of_order):
+        raise CutFailed('output packet timestamps are not strictly increasing' if strict
+                        else 'output packet timestamps go backwards')
     joins = [0] + [float(k - p['first_frame']) for k, n in ((p['k1'], p['head_frames']), (p['k2'], p['tail_frames'])) if n]
     command = ['ffmpeg', '-nostdin', '-v', 'error']
     for join in joins:
@@ -275,6 +304,8 @@ def verify(p, output, run):
     for index in range(len(joins)):
         command += ['-map', f'{index}:v', '-f', 'null', '-']
     returncode, text = run(command, ENGINE)
+    if not strict:
+        text = '\n'.join(line for line in text.splitlines() if line.strip() and not BENIGN_DECODE_WARNING.search(line))
     if returncode or text.strip():
         raise CutFailed('decode errors near a join: ' + text.strip()[-300:])
 
@@ -285,12 +316,15 @@ def run_quietly(command, _engine=ENGINE):
     return result.returncode, result.stderr
 
 
-def cut(source, start, end, work, run=run_quietly, event=lambda status, **details: None):
+def cut(source, start, end, work, run=run_quietly, event=lambda status, **details: None, strict=False):
     """Write the clip [start, end) seconds of `source` to work/clip.mp4 and return its path.
 
     `run(argv, engine)` runs and logs one command and returns (returncode,
     output); `event(status, **details)` logs a step. Raises Unsupported before
-    running anything, or CutFailed afterwards.
+    running anything, or CutFailed afterwards. Head and tail re-encodes run in
+    parallel when `run` is known to be safe for concurrent use (the default
+    runner, or a runner marked `parallel_safe = True`). `strict` makes
+    verification reject any decoder stderr and equal DTS values.
     """
     source, work = Path(source), Path(work)
     p = plan(source, start, end)
@@ -304,16 +338,69 @@ def cut(source, start, end, work, run=run_quietly, event=lambda status, **detail
     step('body', body_command(source, p, work))
     head_delay, tail_delay = edge_delays(p, body_timing(work))
     parts = ['body']
+    edges = []
     if p['head_frames']:
-        step('head', edge_command(source, p, work, 'head', p['first_frame'], p['head_frames'], head_delay))
+        edges.append(('head', edge_command(source, p, work, 'head', p['first_frame'], p['head_frames'], head_delay)))
         parts.insert(0, 'head')
     if p['tail_frames']:
-        step('tail', edge_command(source, p, work, 'tail', p['k2'], p['tail_frames'], tail_delay))
+        edges.append(('tail', edge_command(source, p, work, 'tail', p['k2'], p['tail_frames'], tail_delay)))
         parts.append('tail')
+    if len(edges) == 2 and getattr(run, 'parallel_safe', run is run_quietly):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [(name, pool.submit(run, command, ENGINE)) for name, command in edges]
+            results = [(name, future.result()) for name, future in futures]
+        for name, (returncode, text) in results:
+            if returncode:
+                raise CutFailed(f'{name} step exited with {returncode}: ' + text.strip()[-300:])
+    else:
+        for name, command in edges:
+            step(name, command)
     step('mux', mux_command(source, p, work, parts))
     output = work / 'clip.mp4'
-    verify(p, output, run)
+    try:
+        verify(p, output, run, strict=strict)
+    except CutFailed as exc:
+        # hvc1 keeps parameter sets only in hvcC. Head, body and tail are
+        # encoded separately, so their VPS/SPS/PPS can differ; in that case the
+        # concatenated stream decodes with the wrong RPS. hev1 allows parameter
+        # sets in-band, so retry the mux once before giving up.
+        if p['codec'] != 'hevc' or 'decode errors near a join' not in str(exc):
+            raise
+        event('fallback', codec='hevc', tag='hev1')
+        step('mux', mux_command(source, p, work, parts, tag='hev1'))
+        verify(p, output, run, strict=strict)
     return output
+
+
+def cut_many(source, ranges, work, run=run_quietly, event=lambda status, **details: None, jobs=4, strict=False):
+    """Cut several ranges at once, returning their paths in input order.
+
+    Each clip gets its own directory under `work` (``cut-000/clip.mp4``, ...).
+    Ranges are cut concurrently when `run` is safe for concurrent use; head and
+    tail are kept sequential inside each cut to avoid oversubscribing the CPU.
+    If one range fails, the others may already have been written.
+    """
+    source, work = Path(source), Path(work)
+    ranges = [(start, end) for start, end in ranges]
+    if not ranges:
+        return []
+    work.mkdir(parents=True, exist_ok=True)
+    jobs = max(1, min(int(jobs), len(ranges)))
+
+    def one(index, start, end):
+        folder = work / f'cut-{index:03d}'
+        folder.mkdir(parents=True, exist_ok=True)
+        def edge_run(command, engine=ENGINE):
+            return run(command, engine)
+        edge_run.parallel_safe = False
+        def cut_event(status, **details):
+            event(status, cut=index, **details)
+        return cut(source, start, end, folder, run=edge_run, event=cut_event, strict=strict)
+
+    if jobs == 1 or not getattr(run, 'parallel_safe', run is run_quietly):
+        return [one(index, start, end) for index, (start, end) in enumerate(ranges)]
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        return list(pool.map(lambda item: one(item[0], *item[1]), enumerate(ranges)))
 
 
 def parse_time(value):
@@ -337,6 +424,8 @@ def main(argv=None):
     parser.add_argument('end', type=parse_time, help='seconds, MM:SS or HH:MM:SS (exclusive)')
     parser.add_argument('output', type=Path, help='MP4 file to write')
     parser.add_argument('-v', '--verbose', action='store_true', help='print the plan and every FFmpeg command')
+    parser.add_argument('--strict', action='store_true',
+                        help='fail on any decoder stderr and require strictly increasing DTS')
     parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
     args = parser.parse_args(argv)
 
@@ -344,6 +433,9 @@ def main(argv=None):
         if args.verbose:
             print('+', shlex.join(command), file=sys.stderr)
         return run_quietly(command, engine)
+    # Verbose mode prints commands as they start, so keep the head/tail order
+    # deterministic there; normal runs can encode both edges at once.
+    run.parallel_safe = not args.verbose
 
     def event(status, **details):
         if args.verbose:
@@ -354,7 +446,7 @@ def main(argv=None):
                 or (args.source.exists() and args.output.exists() and args.source.samefile(args.output))):
             raise CutFailed('source and output must be different files')
         with tempfile.TemporaryDirectory(prefix='edgecut-') as work:
-            shutil.copyfile(cut(args.source, args.start, args.end, work, run, event), args.output)
+            shutil.copyfile(cut(args.source, args.start, args.end, work, run, event, strict=args.strict), args.output)
     except Unsupported as exc:
         print(f'edgecut: not supported: {exc} (use a full re-encode instead)', file=sys.stderr)
         return 2

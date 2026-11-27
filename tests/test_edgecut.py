@@ -182,6 +182,17 @@ class EdgecutTests(unittest.TestCase):
             self.assertEqual(edgecut.main([str(source), '1.2', '1.8', str(self.directory / 'short.mp4')]), 2)
         self.assertFalse((self.directory / 'short.mp4').exists())
 
+    def test_cut_many_parallel_ranges(self):
+        source = self.directory / 'source.mp4'
+        make_video(source)
+        work = self.directory / 'batch'
+        ranges = [(0.37, 2.37), (3.37, 5.37)]
+        outputs = edgecut.cut_many(source, ranges, work, jobs=2)
+        self.assertEqual([p.parent.name for p in outputs], ['cut-000', 'cut-001'])
+        for (start, end), output in zip(ranges, outputs):
+            planned = edgecut.plan(source, start, end)
+            self.assert_exact_clip(output, source, start, end, copied=planned['body_frames'])
+
     def test_video_without_audio(self):
         source = self.directory / 'silent.mp4'
         make_video(source, audio_codec=None)
