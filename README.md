@@ -32,7 +32,7 @@ edgecut [-v] [--strict] SOURCE START END OUTPUT
 - `OUTPUT` is an MP4 file with the video tagged `avc1` (or `hvc1`/`hev1` for HEVC), `+faststart`, and timestamps starting at 0.
 - The CLI rejects an output that refers to the source file, including symbolic and hard links.
 - `-v` prints the plan and every FFmpeg command.
-- `--strict` fails on any decoder stderr and requires strictly increasing DTS; the default tolerates known-benign muxer/demuxer warnings and equal DTS values.
+- `--strict` fails on any decoder stderr and requires a strictly increasing DTS on every video packet. The default tolerates known-benign muxer/demuxer warnings and equal DTS values.
 - Exit status: `0` success, `2` source or range not supported (nothing was written; use a full re-encode), `1` a step or the output check failed.
 
 From Python:

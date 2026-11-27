@@ -26,7 +26,7 @@ import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
-__version__ = '0.1.1'
+__version__ = '0.2.0'
 ENGINE = 'edgecut'
 
 # codec: (encoder, extra encoder args, MP4 tag). The parts carry in-band
@@ -274,12 +274,13 @@ def mux_command(source, p, work, parts, tag=None):
 def verify(p, output, run, strict=False):
     """Check frame count, duration, packet order, and decode around each join.
 
-    In strict mode any decoder stderr fails and DTS must strictly increase;
+    In strict mode any decoder stderr fails and every video packet must have
+    a DTS that strictly increases;
     otherwise known-benign muxer/demuxer warnings are ignored and equal DTS
     values are tolerated.
     """
     info = ffprobe(['-select_streams', 'v:0', '-count_packets',
-                    '-show_entries', 'stream=codec_type,nb_read_packets:format=duration:packet=dts_time',
+                    '-show_entries', 'stream=codec_type,nb_read_packets:format=duration:packet=dts',
                     str(output)], error=CutFailed)
     count = next((int(s['nb_read_packets']) for s in info.get('streams', []) if s.get('codec_type') == 'video'), 0)
     expected = p['head_frames'] + p['body_frames'] + p['tail_frames']
@@ -291,8 +292,10 @@ def verify(p, output, run, strict=False):
     # The join must not reorder or rewind container timestamps. Checking the
     # packets is stronger than trusting the decoder's stderr, which also emits
     # harmless muxer warnings for some sources.
-    times = [Fraction(packet['dts_time']) for packet in info.get('packets', [])
-             if packet.get('dts_time') not in (None, 'N/A')]
+    times = [int(packet['dts']) for packet in info.get('packets', [])
+             if packet.get('dts') not in (None, 'N/A')]
+    if strict and len(times) != count:
+        raise CutFailed('output video packets are missing DTS')
     out_of_order = ((later <= earlier) if strict else (later < earlier) for earlier, later in zip(times, times[1:]))
     if any(out_of_order):
         raise CutFailed('output packet timestamps are not strictly increasing' if strict
@@ -316,6 +319,17 @@ def run_quietly(command, _engine=ENGINE):
     return result.returncode, result.stderr
 
 
+def check_source_path(source, output):
+    if (source.resolve() == output.resolve()
+            or (source.exists() and output.exists() and source.samefile(output))):
+        raise CutFailed('source and output must be different files')
+
+
+def check_work_paths(source, work):
+    for name in ('body.ts', 'head.ts', 'tail.ts', 'clip.mp4'):
+        check_source_path(source, work / name)
+
+
 def cut(source, start, end, work, run=run_quietly, event=lambda status, **details: None, strict=False):
     """Write the clip [start, end) seconds of `source` to work/clip.mp4 and return its path.
 
@@ -324,9 +338,10 @@ def cut(source, start, end, work, run=run_quietly, event=lambda status, **detail
     running anything, or CutFailed afterwards. Head and tail re-encodes run in
     parallel when `run` is known to be safe for concurrent use (the default
     runner, or a runner marked `parallel_safe = True`). `strict` makes
-    verification reject any decoder stderr and equal DTS values.
+    verification reject any decoder stderr and missing or non-increasing DTS.
     """
     source, work = Path(source), Path(work)
+    check_work_paths(source, work)
     p = plan(source, start, end)
     event('plan', engine=ENGINE, codec=p['codec'], k1=float(p['k1']), k2=float(p['k2']),
           head_frames=p['head_frames'], body_frames=p['body_frames'], tail_frames=p['tail_frames'])
@@ -384,11 +399,14 @@ def cut_many(source, ranges, work, run=run_quietly, event=lambda status, **detai
     ranges = [(start, end) for start, end in ranges]
     if not ranges:
         return []
+    folders = [work / f'cut-{index:03d}' for index in range(len(ranges))]
+    for folder in folders:
+        check_work_paths(source, folder)
     work.mkdir(parents=True, exist_ok=True)
     jobs = max(1, min(int(jobs), len(ranges)))
 
     def one(index, start, end):
-        folder = work / f'cut-{index:03d}'
+        folder = folders[index]
         folder.mkdir(parents=True, exist_ok=True)
         def edge_run(command, engine=ENGINE):
             return run(command, engine)
@@ -425,7 +443,7 @@ def main(argv=None):
     parser.add_argument('output', type=Path, help='MP4 file to write')
     parser.add_argument('-v', '--verbose', action='store_true', help='print the plan and every FFmpeg command')
     parser.add_argument('--strict', action='store_true',
-                        help='fail on any decoder stderr and require strictly increasing DTS')
+                        help='fail on any decoder stderr and require strictly increasing video packet DTS')
     parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
     args = parser.parse_args(argv)
 
@@ -442,9 +460,7 @@ def main(argv=None):
             print(status, json.dumps(details), file=sys.stderr)
 
     try:
-        if (args.source.resolve() == args.output.resolve()
-                or (args.source.exists() and args.output.exists() and args.source.samefile(args.output))):
-            raise CutFailed('source and output must be different files')
+        check_source_path(args.source, args.output)
         with tempfile.TemporaryDirectory(prefix='edgecut-') as work:
             shutil.copyfile(cut(args.source, args.start, args.end, work, run, event, strict=args.strict), args.output)
     except Unsupported as exc:

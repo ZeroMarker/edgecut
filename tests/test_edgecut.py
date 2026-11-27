@@ -93,11 +93,13 @@ class EdgecutTests(unittest.TestCase):
         plan = dict(events)['plan']
         self.assertEqual((plan['k1'], plan['k2'], plan['body_frames']), (1.0, 5.0, 100))
         self.assert_exact_clip(output, source, 0.37, 5.62, copied=100)
-        info = json.loads(subprocess.check_output(['ffprobe', '-v', 'error', '-select_streams', 'v:0',
-            '-show_entries', 'stream=pix_fmt,profile,color_range,color_space,color_transfer,color_primaries',
-            '-of', 'json', str(output)], timeout=30))['streams'][0]
-        self.assertEqual(info, {'pix_fmt': 'yuv420p', 'profile': 'High', 'color_range': 'tv',
-                               'color_space': 'bt709', 'color_transfer': 'bt709', 'color_primaries': 'bt709'})
+        def video_properties(path):
+            return json.loads(subprocess.check_output(['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                '-show_entries', 'stream=pix_fmt,profile,color_range,color_space,color_transfer,color_primaries',
+                '-of', 'json', str(path)], timeout=30))['streams'][0]
+
+        # Some FFprobe builds omit transfer and primaries even for the source.
+        self.assertEqual(video_properties(output), video_properties(source))
         original, written = gray_frames(source, 0.37, 5.62), gray_frames(output)
         self.assertEqual(len(original), len(written))
         frame_size = 160 * 90

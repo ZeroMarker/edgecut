@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 ### Added
 
@@ -8,7 +8,7 @@
   concurrently into `work/cut-NNN/clip.mp4` (configured with `jobs=`), returned
   in input order.
 - `--strict` and `strict=True` for `cut()` / `cut_many()`: reject any decoder
-  stderr and require strictly increasing container DTS. The default keeps
+  stderr and require a strictly increasing DTS on every video packet. The default keeps
   tolerating known-benign muxer/demuxer warnings.
 - HEVC mux fallback: try `hvc1`, and if the concatenated parts fail to decode
   because their VPS/SPS/PPS differ, remux once as `hev1` and verify again.
@@ -25,6 +25,8 @@
 
 ### Fixed
 
+- Python cuts reject output and intermediate paths that refer to the source,
+  including symbolic and hard links. Batch cuts check all paths before starting.
 - Sources with chapter tracks no longer fail during decode verification.
 - HEVC clips whose independently encoded parts use different parameter sets
   now decode after the `hev1` fallback.

@@ -140,14 +140,14 @@ class VerificationTests(unittest.TestCase):
 
     def test_benign_muxer_warning_does_not_fail(self):
         info = {'streams': [{'codec_type': 'video', 'nb_read_packets': '50'}], 'format': {'duration': '2'},
-                'packets': [{'dts_time': '0.0'}, {'dts_time': '0.04'}]}
+                'packets': [{'dts': i} for i in range(50)]}
         runner = Mock(return_value=(0, 'Application provided invalid, non monotonically increasing dts to muxer in stream 0: 12 >= 12'))
         with patch('edgecut.ffprobe', return_value=info):
             edgecut.verify(self.plan, Path('clip.mp4'), runner)
 
     def test_strict_mode_rejects_benign_muxer_warning(self):
         info = {'streams': [{'codec_type': 'video', 'nb_read_packets': '50'}], 'format': {'duration': '2'},
-                'packets': [{'dts_time': '0.0'}, {'dts_time': '0.04'}]}
+                'packets': [{'dts': i} for i in range(50)]}
         runner = Mock(return_value=(0, 'Application provided invalid, non monotonically increasing dts to muxer in stream 0: 12 >= 12'))
         with patch('edgecut.ffprobe', return_value=info):
             with self.assertRaisesRegex(edgecut.CutFailed, 'decode errors near a join'):
@@ -155,16 +155,31 @@ class VerificationTests(unittest.TestCase):
 
     def test_strict_mode_rejects_equal_dts(self):
         info = {'streams': [{'codec_type': 'video', 'nb_read_packets': '50'}], 'format': {'duration': '2'},
-                'packets': [{'dts_time': '0.04'}, {'dts_time': '0.04'}]}
+                'packets': [{'dts': i} for i in [0, *range(49)]]}
         runner = Mock()
         with patch('edgecut.ffprobe', return_value=info):
             with self.assertRaisesRegex(edgecut.CutFailed, 'not strictly increasing'):
                 edgecut.verify(self.plan, Path('clip.mp4'), runner, strict=True)
         runner.assert_not_called()
 
+    def test_strict_mode_requires_dts_for_every_packet(self):
+        packets = [{'dts': i} for i in range(50)]
+        info = {'streams': [{'codec_type': 'video', 'nb_read_packets': '50'}], 'format': {'duration': '2'},
+                'packets': packets}
+        with patch('edgecut.ffprobe', return_value=info):
+            edgecut.verify(self.plan, Path('clip.mp4'), Mock(return_value=(0, '')), strict=True)
+        for missing in ({}, {'dts': 'N/A'}):
+            packets[1] = missing
+            runner = Mock(return_value=(0, ''))
+            with self.subTest(missing=missing), patch('edgecut.ffprobe', return_value=info):
+                with self.assertRaisesRegex(edgecut.CutFailed, 'missing DTS'):
+                    edgecut.verify(self.plan, Path('clip.mp4'), runner, strict=True)
+                runner.assert_not_called()
+                edgecut.verify(self.plan, Path('clip.mp4'), runner)
+
     def test_backwards_packet_timestamps_fail_before_decode(self):
         info = {'streams': [{'codec_type': 'video', 'nb_read_packets': '50'}], 'format': {'duration': '2'},
-                'packets': [{'dts_time': '0.08'}, {'dts_time': '0.04'}]}
+                'packets': [{'dts': i} for i in [1, 0, *range(2, 50)]]}
         runner = Mock()
         with patch('edgecut.ffprobe', return_value=info):
             with self.assertRaisesRegex(edgecut.CutFailed, 'timestamps go backwards'):
@@ -225,6 +240,36 @@ class FallbackTests(unittest.TestCase):
             with self.assertRaisesRegex(edgecut.CutFailed, 'decode errors'):
                 edgecut.cut('source.mp4', 0, 1, Path('/work'), run=run)
         self.assertEqual(mux.call_count, 1)
+
+
+class WorkPathTests(unittest.TestCase):
+    def test_batch_checks_later_ranges_before_starting_any_cut(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            folder = work / 'cut-001'
+            folder.mkdir()
+            source = folder / 'clip.mp4'
+            source.write_bytes(b'original source')
+            with patch('edgecut.plan') as plan:
+                with self.assertRaisesRegex(edgecut.CutFailed, 'source and output must be different'):
+                    edgecut.cut_many(source, [(0, 2), (2, 4)], work, jobs=2)
+            plan.assert_not_called()
+            self.assertEqual(source.read_bytes(), b'original source')
+
+    def test_cut_rejects_intermediate_files_that_alias_the_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            source = work / 'source.mp4'
+            source.write_bytes(b'original source')
+            (work / 'head.ts').symlink_to(source)
+            os.link(source, work / 'tail.ts')
+            for name in ('head.ts', 'tail.ts'):
+                with self.subTest(name=name), patch('edgecut.plan') as plan:
+                    with self.assertRaisesRegex(edgecut.CutFailed, 'source and output must be different'):
+                        edgecut.cut(source, 0, 2, work)
+                    plan.assert_not_called()
+                (work / name).unlink()
+            self.assertEqual(source.read_bytes(), b'original source')
 
 
 class CommandLineTests(unittest.TestCase):
