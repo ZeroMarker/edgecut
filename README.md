@@ -22,6 +22,9 @@ pipx install edgecut
 
 Or copy `edgecut.py` into your project.
 
+For a reproducible installation, use `uv tool install edgecut==0.2.0`.
+See the [changelog](CHANGELOG.md) for what changed in this release.
+
 ## Usage
 
 ```
@@ -32,32 +35,50 @@ edgecut [-v] [--strict] SOURCE START END OUTPUT
 - `OUTPUT` is an MP4 file with the video tagged `avc1` (or `hvc1`/`hev1` for HEVC), `+faststart`, and timestamps starting at 0.
 - The CLI rejects an output that refers to the source file, including symbolic and hard links.
 - `-v` prints the plan and every FFmpeg command.
-- `--strict` fails on any decoder stderr and requires a strictly increasing DTS on every video packet. The default tolerates known-benign muxer/demuxer warnings and equal DTS values.
+- `--strict` rejects any decoder diagnostics and requires a decode timestamp (DTS) on every video packet. DTS must strictly increase in packet order. Default verification rejects backwards DTS, allows equal DTS, and tolerates known-benign warnings.
 - Exit status: `0` success, `2` source or range not supported (nothing was written; use a full re-encode), `1` a step or the output check failed.
 
-From Python:
+### Python API
 
 ```python
-import tempfile, edgecut
+from pathlib import Path
 
-with tempfile.TemporaryDirectory() as work:
-    try:
-        clip = edgecut.cut('movie.mp4', 3723.5, 3850.0, work)  # returns work/clip.mp4
-    except edgecut.Unsupported:   # raised before anything runs
-        ...                       # fall back to a full re-encode
-    except edgecut.CutFailed:     # a step or the output check failed
-        ...
+import edgecut
+
+work = Path("single-cut")
+work.mkdir(exist_ok=True)
+clip = edgecut.cut("movie.mp4", 0.37, 2.37, work, strict=True)
+print(clip)  # single-cut/clip.mp4
 ```
 
-`cut()` takes optional `run(argv, engine) -> (returncode, output)` and `event(status, **details)` callbacks, so an application can run the FFmpeg commands under its own logging and timeouts.
+`cut()` expects an existing work directory. It raises `Unsupported` if it cannot
+plan the cut and `CutFailed` if a destination aliases the source or a processing
+or verification step fails.
 
-To cut several ranges, use `cut_many()`. Clips are returned in input order and are written to `work/cut-000/clip.mp4`, `work/cut-001/clip.mp4`, ...:
+Use `cut_many()` to cut several ranges from the same source. It creates the work
+directory and returns the paths in input order.
 
 ```python
-paths = edgecut.cut_many('movie.mp4', [(10, 20), (30, 45)], work, jobs=4)
+import edgecut
+
+paths = edgecut.cut_many("movie.mp4", [(0.37, 2.37), (3.37, 5.37)], "batch", jobs=2)
+# batch/cut-000/clip.mp4, batch/cut-001/clip.mp4
 ```
 
-Ranges are cut concurrently when the runner is safe for concurrent use; the two edges of each individual clip stay sequential to avoid oversubscribing the CPU. Pass `strict=True` to `cut()` or `cut_many()` for the same verification policy as the `--strict` flag.
+With the default runner, `jobs` limits how many ranges run concurrently and
+defaults to 4. Each clip's head and tail are encoded sequentially in a batch.
+If a range fails, completed clips may still be on disk.
+
+Both APIs reserve `body.ts`, `head.ts`, `tail.ts`, and `clip.mp4` in each clip's
+work directory. Use a dedicated directory because existing files at those paths
+may be overwritten. The APIs reject paths that resolve to the source file,
+including symbolic and hard links. Batch cuts check all destination paths before
+starting. Pass `strict=True` for the same verification as `--strict`.
+
+Both APIs accept optional `run(argv, engine) -> (returncode, output)` and
+`event(status, **details)` callbacks. Set `run.parallel_safe = True` on a custom
+runner that supports concurrent calls. Batch events include a zero-based `cut`
+index and may arrive concurrently.
 
 Times use the source's absolute presentation timestamps. For sources with a nonzero
 start time (common in MPEG-TS), include that offset in `START` and `END`; inspect it
@@ -76,9 +97,9 @@ clip               [head)[      body       )[tail)
 
 1. **Plan** with ffprobe, without decoding. List the video packets from the keyframe before `start` to 3 s past `end` (with B-frames, frames shown just before `end` can come later in decode order). K1 is the first IDR keyframe at or after `start`, K2 the last at or before `end`; the NAL unit type of each candidate is checked (H.264 5, HEVC 19/20). The clip is rejected if it has fewer than two IDR keyframes or any packet between them is shown outside [K1, K2) (open GOP).
 2. **Body.** Stream-copy [K1, K2) to MPEG-TS with the source timestamps and in-band parameter sets.
-3. **Head and tail.** Re-encode [start, K1) and [K2, end) with libx264 (`veryfast`, CRF 16) or libx265 (`superfast`, CRF 18), without B-frames, matching the source pixel format, H.264 profile, colour properties and time base. The two edges are independent, so they are encoded concurrently. Their DTS is shifted by the body's reorder delay, read from the written body because Matroska stores no DTS, so DTS keeps increasing across both joins.
-4. **Mux.** Concatenate the TS parts, add the source audio (AAC/MP3 copied, others encoded to AAC), shift the first frame to 0, and write MP4 without chapters or metadata. HEVC is first tagged `hvc1`; if the parts decode with mismatched parameter sets, it is remuxed as `hev1`.
-5. **Check.** The frame count must equal the plan, the duration must be within 0.5 s of the clip, and FFmpeg must decode 2 s around the start and each join without errors.
+3. **Head and tail.** Re-encode [start, K1) and [K2, end) with libx264 (`veryfast`, CRF 16) or libx265 (`superfast`, CRF 18), without B-frames, matching the source pixel format, H.264 profile, colour properties and time base. Standalone cuts encode both edges concurrently with the default runner. CLI verbose mode processes them sequentially. Edge DTS is shifted using the reorder delay measured in the copied body so timestamps stay in decode order across both joins.
+4. **Mux.** Concatenate the TS parts, add the source audio (AAC/MP3 copied, others encoded to AAC), shift the first frame to 0, and write MP4 without chapters or metadata. HEVC output is first tagged `hvc1`. If decode verification fails near a join, edgecut remuxes once as `hev1` and verifies again.
+5. **Check.** Compare the video packet count and duration with the plan, check video DTS order, and decode a two-second window at the start and around each join. The duration must be within 0.5 s of the requested clip.
 
 Input seeks use absolute timestamps (`-seek_timestamp 1`). Matroska seeks to a cue,
 while MPEG-TS can land inside a GOP; the planner backs up until it includes a
